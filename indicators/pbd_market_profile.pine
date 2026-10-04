@@ -1,0 +1,415 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//
+// PBD + Market Profile indicator
+// ------------------------------------------------------------------------------------------------
+// Based on the approach Patrick Nill describes (World Cup Trading Championship):
+//   1. Big picture on the 4H chart, execution on the 15m chart.
+//   2. Market profile / volume profile gives the DIRECTION (is value migrating up or down?).
+//   3. Support / resistance ZONES are drawn from the higher timeframe.
+//   4. Entry pattern "PBD": a strong PUSH, then a BASE (range), then the DECISION = the breakout
+//      out of that range. Either
+//        - with the push    -> trend-following trade (filtered by the market-profile / HTF bias), or
+//        - against the push -> counter-trend trade (his favourite), taken at a zone, with a clear
+//                              stop beyond the base and a clear target at the origin of the push.
+//   5. Few trades: optional morning session window and a max number of signals per day.
+// ------------------------------------------------------------------------------------------------
+//@version=5
+indicator("PBD + Market Profile [Push · Base · Decision]", shorttitle = "PBD-MP", overlay = true,
+     max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// ================================================================================================
+// Inputs
+// ================================================================================================
+G_PBD  = "PBD pattern (Push → Base → Decision)"
+pushBars     = input.int(3, "Push: max bars", minval = 1, maxval = 10, group = G_PBD)
+pushAtrMult  = input.float(1.5, "Push: min size (× ATR)", minval = 0.3, step = 0.1, group = G_PBD)
+pushCloseQ   = input.float(0.3, "Push: must close in top/bottom fraction of its range", minval = 0.05, maxval = 1.0, step = 0.05, group = G_PBD)
+minBase      = input.int(2, "Base: min bars", minval = 1, group = G_PBD)
+maxBase      = input.int(12, "Base: max bars", minval = 2, group = G_PBD)
+maxBaseAtr   = input.float(1.2, "Base: max height (× ATR at push)", minval = 0.2, step = 0.1, group = G_PBD)
+maxRetr      = input.float(0.618, "Base: max retracement of the push", minval = 0.1, maxval = 1.0, step = 0.05, group = G_PBD)
+atrLen       = input.int(14, "ATR length", minval = 1, group = G_PBD)
+showTrend    = input.bool(true, "Show trend breakouts (with the push)", group = G_PBD)
+showCounter  = input.bool(true, "Show counter breakouts (against the push)", group = G_PBD)
+
+G_BIAS = "Direction / big picture"
+htfTf        = input.timeframe("240", "Big-picture timeframe", group = G_BIAS)
+emaLen       = input.int(50, "HTF EMA length", minval = 1, group = G_BIAS)
+biasMode     = input.string("MP + HTF", "Trend-trade filter", options = ["MP + HTF", "MP only", "HTF only", "Off"], group = G_BIAS)
+counterBias  = input.bool(false, "Counter trades: skip if bias strongly opposes", group = G_BIAS)
+showEma      = input.bool(false, "Plot HTF EMA", group = G_BIAS)
+
+G_MP   = "Market profile (previous day)"
+mpSource     = input.string("Volume", "Profile built from", options = ["Volume", "TPO (time)"], group = G_MP)
+mpRows       = input.int(40, "Profile rows", minval = 10, maxval = 200, group = G_MP)
+vaPct        = input.float(70.0, "Value area %", minval = 50, maxval = 95, group = G_MP) / 100.0
+showMP       = input.bool(true, "Plot previous day POC / VAH / VAL", group = G_MP)
+
+G_ZONE = "Support / resistance zones (HTF)"
+zLen         = input.int(5, "HTF pivot strength (bars each side)", minval = 1, maxval = 30, group = G_ZONE)
+zWidth       = input.float(0.3, "Zone thickness (× HTF ATR)", minval = 0.05, step = 0.05, group = G_ZONE)
+maxZones     = input.int(12, "Max zones kept", minval = 1, maxval = 100, group = G_ZONE)
+confTol      = input.float(0.25, "Confluence tolerance (× HTF ATR)", minval = 0.0, step = 0.05, group = G_ZONE)
+counterZone  = input.bool(true, "Counter trades need a zone / profile level at the push extreme", group = G_ZONE)
+useMPLevels  = input.bool(true, "Count prev-day VAH / VAL / POC / High / Low as levels", group = G_ZONE)
+showZones    = input.bool(true, "Draw zones", group = G_ZONE)
+
+G_RISK = "Trade levels"
+rrTrend      = input.float(2.0, "Trend trades: target (R multiple)", minval = 0.5, step = 0.25, group = G_RISK)
+counterTgt   = input.string("Push origin", "Counter trades: target", options = ["Push origin", "R multiple"], group = G_RISK)
+rrCounter    = input.float(2.0, "Counter trades: target (R multiple, if selected)", minval = 0.5, step = 0.25, group = G_RISK)
+minRR        = input.float(1.0, "Min reward : risk to show a signal", minval = 0.0, step = 0.1, group = G_RISK)
+slBufAtr     = input.float(0.1, "Stop buffer beyond base (× ATR)", minval = 0.0, step = 0.05, group = G_RISK)
+projBars     = input.int(20, "Draw entry / SL / TP for N bars", minval = 1, maxval = 400, group = G_RISK)
+
+G_SESS = "Session / frequency"
+useSess      = input.bool(false, "Only signal inside session", group = G_SESS)
+sess         = input.session("0800-1200", "Session", group = G_SESS)
+sessTz       = input.string("Europe/Berlin", "Session timezone", group = G_SESS)
+maxPerDay    = input.int(2, "Max signals per day (0 = unlimited)", minval = 0, group = G_SESS)
+
+G_VIS  = "Visuals"
+showBase     = input.bool(true, "Draw base box on signal", group = G_VIS)
+showLevels   = input.bool(true, "Draw entry / SL / TP", group = G_VIS)
+showFiltered = input.bool(false, "Mark filtered-out breakouts (grey)", group = G_VIS)
+showTable    = input.bool(true, "Show dashboard", group = G_VIS)
+colBull      = input.color(color.new(#26a69a, 0), "Bull", group = G_VIS)
+colBear      = input.color(color.new(#ef5350, 0), "Bear", group = G_VIS)
+
+// ================================================================================================
+// Core series
+// ================================================================================================
+atr    = ta.atr(atrLen)
+newDay = ta.change(time("D")) != 0
+
+// Higher timeframe data, non-repainting (previous closed HTF bar + lookahead_on)
+[htfE, htfEPrev, htfC, htfAtr, htfPH, htfPL, htfPT] = request.security(syminfo.tickerid, htfTf,
+     [ta.ema(close, emaLen)[1], ta.ema(close, emaLen)[2], close[1], ta.atr(14)[1],
+      ta.pivothigh(high, zLen, zLen)[1], ta.pivotlow(low, zLen, zLen)[1], time[zLen + 1]],
+     lookahead = barmerge.lookahead_on)
+newHtf = ta.change(time(htfTf)) != 0
+lvlAtr = nz(htfAtr, atr)
+
+int htfBias = 0
+if not na(htfE) and not na(htfEPrev)
+    htfBias := htfC > htfE and htfE > htfEPrev ? 1 : htfC < htfE and htfE < htfEPrev ? -1 : 0
+
+// ================================================================================================
+// Market profile of the previous day (POC / VAH / VAL) and value-area migration
+// ================================================================================================
+f_profile(float[] hs, float[] ls, float[] ws, int rows, float pct) =>
+    float poc = na
+    float vah = na
+    float val = na
+    int n = array.size(hs)
+    if n > 0
+        float top  = array.max(hs)
+        float bot  = array.min(ls)
+        float step = (top - bot) / rows
+        if step > 0
+            float[] bins = array.new_float(rows, 0.0)
+            for i = 0 to n - 1
+                int lo = math.max(0, math.min(rows - 1, math.floor((array.get(ls, i) - bot) / step)))
+                int hi = math.max(0, math.min(rows - 1, math.floor((array.get(hs, i) - bot) / step)))
+                float share = array.get(ws, i) / (hi - lo + 1)
+                for j = lo to hi
+                    array.set(bins, j, array.get(bins, j) + share)
+            int pocIdx  = array.indexof(bins, array.max(bins))
+            float total = array.sum(bins)
+            float acc   = array.get(bins, pocIdx)
+            int up = pocIdx
+            int dn = pocIdx
+            while acc < total * pct and (up < rows - 1 or dn > 0)
+                float vUp = up < rows - 1 ? array.get(bins, up + 1) : -1.0
+                float vDn = dn > 0 ? array.get(bins, dn - 1) : -1.0
+                if vUp >= vDn
+                    up += 1
+                    acc += vUp
+                else
+                    dn -= 1
+                    acc += vDn
+            poc := bot + (pocIdx + 0.5) * step
+            vah := bot + (up + 1) * step
+            val := bot + dn * step
+        else
+            poc := top
+            vah := top
+            val := bot
+    [poc, vah, val]
+
+var float[] dH = array.new_float()
+var float[] dL = array.new_float()
+var float[] dW = array.new_float()
+var float prevPOC  = na
+var float prevVAH  = na
+var float prevVAL  = na
+var float prev2POC = na
+var float prev2VAH = na
+var float prev2VAL = na
+var float prevHigh = na
+var float prevLow  = na
+
+if newDay and array.size(dH) > 0
+    [p, vh, vl] = f_profile(dH, dL, dW, mpRows, vaPct)
+    prev2POC := prevPOC
+    prev2VAH := prevVAH
+    prev2VAL := prevVAL
+    prevPOC  := p
+    prevVAH  := vh
+    prevVAL  := vl
+    prevHigh := array.max(dH)
+    prevLow  := array.min(dL)
+    array.clear(dH)
+    array.clear(dL)
+    array.clear(dW)
+
+array.push(dH, high)
+array.push(dL, low)
+array.push(dW, mpSource == "Volume" and nz(volume) > 0 ? volume : 1.0)
+
+// Value migrating up = bullish, down = bearish; overlapping value -> use price vs. yesterday's value area
+int mpBias = 0
+if not na(prevPOC) and not na(prev2POC)
+    if prevPOC > prev2POC and prevVAL >= prev2VAL
+        mpBias := 1
+    else if prevPOC < prev2POC and prevVAH <= prev2VAH
+        mpBias := -1
+if mpBias == 0 and not na(prevVAH)
+    mpBias := close > prevVAH ? 1 : close < prevVAL ? -1 : 0
+
+int bias = switch biasMode
+    "MP + HTF" => mpBias == htfBias ? mpBias : 0
+    "MP only"  => mpBias
+    "HTF only" => htfBias
+    => 0
+
+// ================================================================================================
+// HTF support / resistance zones
+// ================================================================================================
+var float[] zTop = array.new_float()
+var float[] zBot = array.new_float()
+var box[]   zBox = array.new_box()
+
+f_addZone(float top, float bot, int t, color col) =>
+    bool overlap = false
+    int n = array.size(zTop)
+    if n > 0
+        for i = 0 to n - 1
+            if array.get(zTop, i) >= bot and array.get(zBot, i) <= top
+                overlap := true
+    if not overlap
+        array.push(zTop, top)
+        array.push(zBot, bot)
+        box b = showZones ? box.new(t, top, time, bot, xloc = xloc.bar_time, extend = extend.right,
+             bgcolor = color.new(col, 85), border_color = color.new(col, 60)) : na
+        array.push(zBox, b)
+        if array.size(zTop) > maxZones
+            array.shift(zTop)
+            array.shift(zBot)
+            box.delete(array.shift(zBox))
+    overlap
+
+if newHtf and not na(htfAtr) and not na(htfPT)
+    if not na(htfPH)
+        f_addZone(htfPH, htfPH - zWidth * htfAtr, htfPT, colBear)
+    if not na(htfPL)
+        f_addZone(htfPL + zWidth * htfAtr, htfPL, htfPT, colBull)
+
+f_atLevel(float price, float tol) =>
+    bool hit = false
+    int n = array.size(zTop)
+    if n > 0
+        for i = 0 to n - 1
+            if price <= array.get(zTop, i) + tol and price >= array.get(zBot, i) - tol
+                hit := true
+    if useMPLevels and not hit
+        hit := (not na(prevVAH)  and math.abs(price - prevVAH)  <= tol) or
+               (not na(prevVAL)  and math.abs(price - prevVAL)  <= tol) or
+               (not na(prevPOC)  and math.abs(price - prevPOC)  <= tol) or
+               (not na(prevHigh) and math.abs(price - prevHigh) <= tol) or
+               (not na(prevLow)  and math.abs(price - prevLow)  <= tol)
+    hit
+
+// ================================================================================================
+// PBD state machine:  idle -> (push) -> building base -> (breakout) -> signal
+// ================================================================================================
+pHiN = ta.highest(high, pushBars)
+pLoN = ta.lowest(low, pushBars)
+pRng = pHiN - pLoN
+upPush = close > open and close - pLoN >= pushAtrMult * atr and close >= pHiN - pushCloseQ * pRng
+dnPush = close < open and pHiN - close >= pushAtrMult * atr and close <= pLoN + pushCloseQ * pRng
+
+var int   st     = 0     // 0 = waiting for push, 1 = building base
+var int   pDir   = 0     // direction of the push
+var float pOrg   = na    // where the push started
+var float pExt   = na    // push extreme
+var float pAtr   = na
+var float bHi    = na
+var float bLo    = na
+var int   bCnt   = 0
+var int   bStart = na
+
+int   sig        = 0
+bool  sigCounter = false
+float sigBHi     = na
+float sigBLo     = na
+float sigOrg     = na
+float sigExt     = na
+int   sigBStart  = na
+
+if not na(atr)
+    if st == 1
+        bool bullBrk = bCnt >= minBase and close > bHi
+        bool bearBrk = bCnt >= minBase and close < bLo
+        if bullBrk or bearBrk
+            sig        := bullBrk ? 1 : -1
+            sigCounter := sig != pDir
+            sigBHi     := bHi
+            sigBLo     := bLo
+            sigOrg     := pOrg
+            sigExt     := pExt
+            sigBStart  := bStart
+            st         := 0
+        else
+            // Push still running before a real base formed -> extend the push
+            bool cont = bCnt < minBase and ((pDir == 1 and close > pExt) or (pDir == -1 and close < pExt))
+            if cont
+                pExt := pDir == 1 ? math.max(pExt, high) : math.min(pExt, low)
+                bHi  := na
+                bLo  := na
+                bCnt := 0
+            else
+                float nh  = na(bHi) ? high : math.max(bHi, high)
+                float nl  = na(bLo) ? low : math.min(bLo, low)
+                float lim = pDir == 1 ? pExt - maxRetr * (pExt - pOrg) : pExt + maxRetr * (pOrg - pExt)
+                bool tooTall = nh - nl > maxBaseAtr * pAtr
+                bool tooDeep = pDir == 1 ? nl < lim : nh > lim
+                if tooTall or tooDeep or bCnt + 1 > maxBase
+                    st := 0
+                else
+                    if na(bHi)
+                        bStart := bar_index
+                    bHi  := nh
+                    bLo  := nl
+                    bCnt += 1
+    if st == 0 and sig == 0 and (upPush or dnPush)
+        st   := 1
+        pDir := upPush ? 1 : -1
+        pOrg := upPush ? pLoN : pHiN
+        pExt := upPush ? pHiN : pLoN
+        pAtr := atr
+        bHi  := na
+        bLo  := na
+        bCnt := 0
+
+// ================================================================================================
+// Filters, trade levels, drawing
+// ================================================================================================
+inSess = not useSess or not na(time(timeframe.period, sess, sessTz))
+
+var int dayCount = 0
+if newDay
+    dayCount := 0
+
+bool  valid    = false
+bool  filtered = false
+float entry    = close
+float sl       = na
+float tp       = na
+float rrAct    = na
+bool  atZone   = false
+
+if sig != 0
+    float buf = slBufAtr * atr
+    sl := sig == 1 ? sigBLo - buf : sigBHi + buf
+    float risk = math.abs(entry - sl)
+    if sigCounter
+        tp := counterTgt == "Push origin" ? sigOrg : entry + sig * rrCounter * risk
+    else
+        tp := entry + sig * rrTrend * risk
+    rrAct  := risk > 0 ? (tp - entry) * sig / risk : 0.0
+    atZone := f_atLevel(sigExt, confTol * lvlAtr)
+
+    bool passTrend   = not sigCounter and showTrend and (biasMode == "Off" or bias == sig)
+    bool passCounter = sigCounter and showCounter and (not counterZone or atZone) and (not counterBias or bias != -sig)
+    bool passCommon  = rrAct >= minRR and inSess and (maxPerDay == 0 or dayCount < maxPerDay)
+    valid    := (passTrend or passCounter) and passCommon
+    filtered := not valid
+
+if valid
+    dayCount += 1
+    color c = sig == 1 ? colBull : colBear
+    if showBase
+        box.new(sigBStart, sigBHi, bar_index - 1, sigBLo, border_color = color.new(c, 30),
+             bgcolor = color.new(c, 88), border_style = line.style_dotted)
+    if showLevels
+        line.new(bar_index, entry, bar_index + projBars, entry, color = color.gray, width = 1)
+        line.new(bar_index, sl, bar_index + projBars, sl, color = colBear, style = line.style_dashed)
+        line.new(bar_index, tp, bar_index + projBars, tp, color = colBull, style = line.style_dashed)
+    string kind = sigCounter ? "COUNTER" : "TREND"
+    string txt = (sig == 1 ? "PBD LONG " : "PBD SHORT ") + kind +
+         "\nE " + str.tostring(entry, format.mintick) +
+         "\nSL " + str.tostring(sl, format.mintick) +
+         "\nTP " + str.tostring(tp, format.mintick) +
+         "\nR:R " + str.tostring(rrAct, "#.##") + (atZone ? "\n@ zone" : "")
+    label.new(bar_index, sig == 1 ? low : high, txt, color = color.new(c, 10), textcolor = color.white,
+         style = sig == 1 ? label.style_label_up : label.style_label_down, size = size.small)
+    alert(syminfo.ticker + " " + (sig == 1 ? "LONG " : "SHORT ") + kind + " | entry " + str.tostring(entry, format.mintick) +
+         " | SL " + str.tostring(sl, format.mintick) + " | TP " + str.tostring(tp, format.mintick) +
+         " | R:R " + str.tostring(rrAct, "#.##"), alert.freq_once_per_bar_close)
+
+longTrend    = valid and sig == 1 and not sigCounter
+shortTrend   = valid and sig == -1 and not sigCounter
+longCounter  = valid and sig == 1 and sigCounter
+shortCounter = valid and sig == -1 and sigCounter
+
+plotshape(longTrend, "Long (trend)", shape.triangleup, location.belowbar, colBull, size = size.tiny)
+plotshape(shortTrend, "Short (trend)", shape.triangledown, location.abovebar, colBear, size = size.tiny)
+plotshape(longCounter, "Long (counter)", shape.diamond, location.belowbar, colBull, size = size.tiny)
+plotshape(shortCounter, "Short (counter)", shape.diamond, location.abovebar, colBear, size = size.tiny)
+plotshape(showFiltered and filtered, "Filtered breakout", shape.xcross, location.abovebar, color.new(color.gray, 30), size = size.tiny)
+
+plot(showMP and not newDay ? prevPOC : na, "Prev POC", color.new(color.orange, 0), 2, plot.style_linebr)
+plot(showMP and not newDay ? prevVAH : na, "Prev VAH", color.new(color.blue, 30), 1, plot.style_linebr)
+plot(showMP and not newDay ? prevVAL : na, "Prev VAL", color.new(color.blue, 30), 1, plot.style_linebr)
+plot(showEma ? htfE : na, "HTF EMA", color.new(color.purple, 0), 2)
+
+// Live base currently forming
+var box liveBox = na
+if barstate.islast
+    box.delete(liveBox)
+    liveBox := na
+    if st == 1 and bCnt > 0
+        liveBox := box.new(bStart, bHi, bar_index, bLo, border_color = color.new(color.gray, 20),
+             bgcolor = color.new(color.gray, 90), border_style = line.style_dashed)
+
+// ================================================================================================
+// Dashboard
+// ================================================================================================
+f_biasTxt(int b) => b == 1 ? "Bullish" : b == -1 ? "Bearish" : "Neutral"
+f_biasCol(int b) => b == 1 ? colBull : b == -1 ? colBear : color.gray
+
+var table tb = table.new(position.top_right, 2, 6, bgcolor = color.new(color.black, 20), border_width = 1)
+if showTable and barstate.islast
+    table.cell(tb, 0, 0, "PBD + MP", text_color = color.white, text_size = size.small)
+    table.cell(tb, 1, 0, syminfo.ticker, text_color = color.white, text_size = size.small)
+    table.cell(tb, 0, 1, "HTF (" + htfTf + ")", text_color = color.white, text_size = size.small)
+    table.cell(tb, 1, 1, f_biasTxt(htfBias), text_color = color.white, bgcolor = f_biasCol(htfBias), text_size = size.small)
+    table.cell(tb, 0, 2, "Market profile", text_color = color.white, text_size = size.small)
+    table.cell(tb, 1, 2, f_biasTxt(mpBias), text_color = color.white, bgcolor = f_biasCol(mpBias), text_size = size.small)
+    table.cell(tb, 0, 3, "Trend filter", text_color = color.white, text_size = size.small)
+    table.cell(tb, 1, 3, biasMode == "Off" ? "Off" : f_biasTxt(bias), text_color = color.white, bgcolor = f_biasCol(bias), text_size = size.small)
+    table.cell(tb, 0, 4, "PBD state", text_color = color.white, text_size = size.small)
+    table.cell(tb, 1, 4, st == 1 ? "Base " + str.tostring(bCnt) + " bars after " + (pDir == 1 ? "UP" : "DOWN") + " push" : "Waiting for push",
+         text_color = color.white, text_size = size.small)
+    table.cell(tb, 0, 5, "Signals today", text_color = color.white, text_size = size.small)
+    table.cell(tb, 1, 5, str.tostring(dayCount) + (maxPerDay > 0 ? " / " + str.tostring(maxPerDay) : ""), text_color = color.white, text_size = size.small)
+
+// ================================================================================================
+// Alerts (use "Once per bar close")
+// ================================================================================================
+alertcondition(longTrend, "PBD Long (trend)", "PBD trend LONG on {{ticker}} at {{close}}")
+alertcondition(shortTrend, "PBD Short (trend)", "PBD trend SHORT on {{ticker}} at {{close}}")
+alertcondition(longCounter, "PBD Long (counter)", "PBD counter LONG on {{ticker}} at {{close}}")
+alertcondition(shortCounter, "PBD Short (counter)", "PBD counter SHORT on {{ticker}} at {{close}}")
+alertcondition(valid, "PBD any signal", "PBD signal on {{ticker}} at {{close}}")
